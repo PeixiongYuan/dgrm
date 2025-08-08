@@ -3,6 +3,7 @@ use crate::error::{DgrmError, Result};
 use csv::ReaderBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::Array2;
+use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
 use std::time::Instant;
@@ -139,6 +140,49 @@ impl VntrData {
         })
     }
 
+    /// Filter samples by a set of sample IDs and return a new VntrData
+    pub fn filter_by_sample_set(&self, keep: &HashSet<String>) -> Result<Self> {
+        if keep.is_empty() {
+            return Ok(self.clone());
+        }
+
+        // Collect indices to keep
+        let mut indices: Vec<usize> = Vec::new();
+        let mut new_sample_ids: Vec<String> = Vec::new();
+        for (idx, sid) in self.sample_ids.iter().enumerate() {
+            if keep.contains(sid) {
+                indices.push(idx);
+                new_sample_ids.push(sid.clone());
+            }
+        }
+
+        if indices.is_empty() {
+            return Err(DgrmError::InvalidFormat(
+                "No samples from --keep file were found in the input data".to_string(),
+            ));
+        }
+
+        // Build new dosage matrix with selected rows
+        let n_variants = self.n_variants;
+        let mut new_matrix = Array2::<f64>::zeros((indices.len(), n_variants));
+        for (new_i, &old_i) in indices.iter().enumerate() {
+            let row = self.dosage_matrix.row(old_i);
+            new_matrix.row_mut(new_i).assign(&row);
+        }
+
+        log::info!(
+            "Applied --keep filter: kept {} of {} samples",
+            new_sample_ids.len(),
+            self.sample_ids.len()
+        );
+
+        Ok(VntrData {
+            sample_ids: new_sample_ids,
+            dosage_matrix: new_matrix,
+            n_variants,
+        })
+    }
+
     /// Get number of samples
     pub fn n_samples(&self) -> usize {
         self.sample_ids.len()
@@ -158,5 +202,32 @@ impl VntrData {
     pub fn dosage_matrix(&self) -> &Array2<f64> {
         &self.dosage_matrix
     }
+}
+
+/// Read a keep file (two-column FID IID or single-column ID) and return a set of IDs (use IID if two columns)
+pub fn read_keep_file<P: AsRef<Path>>(path: P) -> Result<HashSet<String>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Err(DgrmError::FileNotFound { path: path.display().to_string() });
+    }
+
+    let content = std::fs::read_to_string(path)?;
+    let mut set = HashSet::new();
+    for (ln, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() == 1 {
+            set.insert(cols[0].to_string());
+        } else if cols.len() >= 2 {
+            // Use second column (IID) by convention
+            set.insert(cols[1].to_string());
+        } else {
+            return Err(DgrmError::InvalidFormat(format!("Invalid line {} in keep file", ln + 1)));
+        }
+    }
+
+    log::info!("Loaded {} sample IDs from --keep file: {}", set.len(), path.display());
+    Ok(set)
 }
 

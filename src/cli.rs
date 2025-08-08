@@ -74,4 +74,12 @@ pub struct Args {
     )]
     pub max_maf: Option<f64>,
 
+    /// Keep only samples listed in this file (two columns: FID IID or single column)
+    #[arg(
+        long = "keep",
+        value_name = "KEEP_FILE",
+        help = "Path to a file containing sample IDs to keep (format: FID IID or single ID per line)"
+    )]
+    pub keep: Option<PathBuf>,
+
 }

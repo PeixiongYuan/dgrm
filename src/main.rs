@@ -11,7 +11,7 @@ mod error;
 use grm_calculator::MafFilter;
 
 use cli::Args;
-use data_io::VntrData;
+use data_io::{VntrData, read_keep_file};
 use grm_calculator::GrmCalculator;
 use gcta_writer::GctaWriter;
 
@@ -33,9 +33,19 @@ fn main() -> Result<()> {
     
     // Load VNTR data
     log::info!("Loading VNTR data...");
-    let vntr_data = VntrData::load(&args.input)?;
+    let mut vntr_data = VntrData::load(&args.input)?;
     log::info!("Loaded {} samples and {} variants", 
                vntr_data.n_samples(), vntr_data.n_variants());
+
+    // Apply --keep filter if provided
+    if let Some(keep_path) = &args.keep {
+        let keep_set = read_keep_file(keep_path)?;
+        vntr_data = vntr_data.filter_by_sample_set(&keep_set)?;
+        log::info!(
+            "After --keep filtering: {} samples remain",
+            vntr_data.n_samples()
+        );
+    }
     
     // Prepare MAF filter
     let maf_filter = if args.maf.is_some() || args.max_maf.is_some() {
