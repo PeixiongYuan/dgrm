@@ -26,7 +26,7 @@ impl GctaWriter {
         let stats = grm_matrix.calculate_stats();
 
         // Write binary files
-        self.write_grm_n_bin(grm_matrix.n_variants())?;
+        self.write_grm_n_bin(grm_matrix)?;
         self.write_grm_bin(grm_matrix)?;
         
         // Write text files
@@ -44,14 +44,26 @@ impl GctaWriter {
         Ok(())
     }
 
-    /// Write number of variants as 4-byte integer
-    fn write_grm_n_bin(&self, n_variants: usize) -> Result<()> {
+    /// Write number of variants per GRM element (4-byte integer for each upper-triangular element)
+    /// GCTA expects one 4-byte integer per element in the same order as .grm.bin
+    fn write_grm_n_bin(&self, grm_matrix: &GrmMatrix) -> Result<()> {
         let file_path = format!("{}.grm.N.bin", self.output_prefix);
         let mut file = File::create(&file_path)?;
-        
-        file.write_i32::<LittleEndian>(n_variants as i32)?;
-        
-        log::debug!("Written {} variants to {}", n_variants, file_path);
+
+        let n_samples = grm_matrix.n_samples();
+        let n_variants = grm_matrix.n_variants();
+        let num_elements = (n_samples * (n_samples + 1)) / 2; // upper triangular with diagonal
+
+        for _ in 0..num_elements {
+            file.write_i32::<LittleEndian>(n_variants as i32)?;
+        }
+
+        log::debug!(
+            "Written N per-element ({} ints, value = {}) to {}",
+            num_elements,
+            n_variants,
+            file_path
+        );
         Ok(())
     }
 
