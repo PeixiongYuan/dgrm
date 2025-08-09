@@ -3,6 +3,7 @@ use crate::error::{DgrmError, Result};
 use csv::ReaderBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::Array2;
+use fast_float::parse as fast_parse;
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
@@ -71,13 +72,15 @@ impl VntrData {
             sample_ids.push(sample_id.to_string());
 
             // Remaining columns are dosage values
-            let mut row_data = Vec::new();
+            let mut row_data = Vec::with_capacity(record.len().saturating_sub(1));
             for i in 1..record.len() {
-                let value_str = record.get(i).unwrap_or("0");
-                let value: f64 = value_str.parse()
+                let value_str = record.get(i).unwrap_or("");
+                // Fast path parse; fall back to standard parser for special values like NaN/inf
+                let value: f64 = fast_parse(value_str)
+                    .or_else(|_| value_str.parse::<f64>())
                     .map_err(|_| DgrmError::InvalidFormat(
-                        format!("Invalid numeric value '{}' on line {}, column {}", 
-                               value_str, line_num + 1, i + 1)
+                        format!("Invalid numeric value '{}' on line {}, column {}",
+                                value_str, line_num + 1, i + 1)
                     ))?;
                 row_data.push(value);
             }
@@ -115,20 +118,29 @@ impl VntrData {
         }
 
         // Create dosage matrix
-        let mut dosage_matrix = Array2::from_shape_vec((n_samples, n_variants), dosage_data)
+        let dosage_matrix = Array2::from_shape_vec((n_samples, n_variants), dosage_data)
             .map_err(|e| DgrmError::InvalidFormat(format!("Matrix creation failed: {}", e)))?;
-
-        // Handle missing values (NaN) - replace with 0
-        let missing_count = dosage_matrix.iter().filter(|&&x| x.is_nan()).count();
+        
+        // Report missing values but do not impute here; let computation phase handle it
+        let missing_count = dosage_matrix.iter().filter(|&&x| !x.is_finite() || x.is_nan()).count();
         if missing_count > 0 {
-            log::warn!("Found {} missing values, replacing with 0", missing_count);
-            dosage_matrix.mapv_inplace(|x| if x.is_nan() { 0.0 } else { x });
+            log::warn!("Found {} missing or non-finite values; they will be imputed during computation", missing_count);
         }
 
         // Data quality information
-        let min_val = dosage_matrix.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-        let max_val = dosage_matrix.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        let mean_val = dosage_matrix.mean().unwrap_or(0.0);
+        let mut min_val = f64::INFINITY;
+        let mut max_val = f64::NEG_INFINITY;
+        let mut sum_val = 0.0f64;
+        let mut cnt_val: usize = 0;
+        for &x in dosage_matrix.iter() {
+            if x.is_finite() {
+                if x < min_val { min_val = x; }
+                if x > max_val { max_val = x; }
+                sum_val += x;
+                cnt_val += 1;
+            }
+        }
+        let mean_val = if cnt_val > 0 { sum_val / cnt_val as f64 } else { f64::NAN };
         
         log::info!("Data range: [{:.4}, {:.4}]", min_val, max_val);
         log::info!("Mean dosage: {:.4}", mean_val);

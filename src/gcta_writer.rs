@@ -2,7 +2,7 @@
 use crate::data_io::VntrData;
 use crate::error::Result;
 use crate::grm_calculator::{GrmMatrix, GrmStats};
-use byteorder::{LittleEndian, WriteBytesExt};
+use bytemuck::cast_slice;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
@@ -19,14 +19,14 @@ impl GctaWriter {
     }
 
     /// Write GRM in GCTA format
-    pub fn write_grm(&self, grm_matrix: &GrmMatrix, _vntr_data: &VntrData) -> Result<()> {
+    pub fn write_grm(&self, grm_matrix: &GrmMatrix, vntr_data: &VntrData) -> Result<()> {
         log::info!("Writing GCTA GRM files with prefix: {}", self.output_prefix);
 
         // Calculate statistics
         let stats = grm_matrix.calculate_stats();
 
         // Write binary files
-        self.write_grm_n_bin(grm_matrix)?;
+        self.write_grm_n_bin(grm_matrix, vntr_data)?;
         self.write_grm_bin(grm_matrix)?;
         
         // Write text files
@@ -44,44 +44,40 @@ impl GctaWriter {
         Ok(())
     }
 
-    /// Write number of variants per GRM element (4-byte integer for each upper-triangular element)
-    /// GCTA expects one 4-byte integer per element in the same order as .grm.bin
-    fn write_grm_n_bin(&self, grm_matrix: &GrmMatrix) -> Result<()> {
+    /// Write number of variants per GRM element (4-byte FLOAT per element), row-major lower triangular
+    fn write_grm_n_bin(&self, grm_matrix: &GrmMatrix, _vntr_data: &VntrData) -> Result<()> {
         let file_path = format!("{}.grm.N.bin", self.output_prefix);
-        let mut file = File::create(&file_path)?;
+        let file = File::create(&file_path)?;
+        let mut writer = BufWriter::new(file);
 
-        let n_samples = grm_matrix.n_samples();
-        let n_variants = grm_matrix.n_variants();
-        let num_elements = (n_samples * (n_samples + 1)) / 2; // upper triangular with diagonal
+        let n = grm_matrix.n_samples();
+        let m = grm_matrix.n_variants() as f32;
+        let len = n * (n + 1) / 2;
+        let buf = vec![m; len];
+        writer.write_all(cast_slice(&buf))?;
 
-        for _ in 0..num_elements {
-            file.write_i32::<LittleEndian>(n_variants as i32)?;
-        }
-
-        log::debug!(
-            "Written N per-element ({} ints, value = {}) to {}",
-            num_elements,
-            n_variants,
-            file_path
-        );
+        writer.flush()?;
+        log::debug!("Written per-pair N (float) in row-major lower-triangular order to {}", file_path);
         Ok(())
     }
 
-    /// Write GRM values as 4-byte floats (upper triangular including diagonal)
+    /// Write GRM values as 4-byte floats, row-major lower-triangular (including diagonal)
     fn write_grm_bin(&self, grm_matrix: &GrmMatrix) -> Result<()> {
         let file_path = format!("{}.grm.bin", self.output_prefix);
         let file = File::create(&file_path)?;
         let mut writer = BufWriter::new(file);
-        
-        let values = grm_matrix.upper_triangular_values();
-        
-        for &value in &values {
-            writer.write_f32::<LittleEndian>(value as f32)?;
+
+        let n = grm_matrix.n_samples();
+        let mut buf = Vec::<f32>::with_capacity(n * (n + 1) / 2);
+        for j in 0..n {
+            for k in 0..=j {
+                buf.push(grm_matrix.value(j, k) as f32);
+            }
         }
-        
+        writer.write_all(cast_slice(&buf))?;
+
         writer.flush()?;
-        
-        log::debug!("Written {} GRM values to {}", values.len(), file_path);
+        log::debug!("Written GRM values (float) in row-major lower-triangular order to {}", file_path);
         Ok(())
     }
 

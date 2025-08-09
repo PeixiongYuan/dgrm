@@ -3,6 +3,7 @@ use crate::data_io::VntrData;
 use crate::error::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::Array2;
+use ndarray::s;
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::time::Instant;
@@ -166,72 +167,104 @@ impl GrmCalculator {
             ));
         }
 
-        // Initialize result matrix with zeros
-        let mut grm_matrix = Array2::<f64>::zeros((n_samples, n_samples));
-        
-        // Calculate GRM using Pearson correlation method with forced diagonal = 1.0
-        log::info!("Computing GRM using correlation method...");
-        pb.set_message("Computing correlation matrix");
-        
-        // Create sample data matrix for valid variants only
-        let mut sample_data = Array2::<f64>::zeros((n_samples, n_valid_variants));
+        // Build imputed data matrix for valid variants only
+        log::info!("Computing GRM via standardized matrix multiplication...");
+        pb.set_message("Building imputed matrix Z");
+        let mut z = Array2::<f64>::zeros((n_samples, n_valid_variants));
         for (new_idx, &variant_idx) in valid_variants.iter().enumerate() {
+            let mean_val = allele_freqs[variant_idx] * 2.0;
             for sample_idx in 0..n_samples {
                 let value = dosage_matrix[[sample_idx, variant_idx]];
-                sample_data[[sample_idx, new_idx]] = if value.is_finite() && !value.is_nan() {
+                z[[sample_idx, new_idx]] = if value.is_finite() && !value.is_nan() {
                     value
                 } else {
-                    // Use variant mean for missing values
-                    allele_freqs[variant_idx] * 2.0
+                    mean_val
                 };
             }
         }
-        
-        // Pre-compute sample means and standard deviations
-        let mut sample_means = vec![0.0; n_samples];
-        let mut sample_stds = vec![0.0; n_samples];
-        
+
+        // Standardize rows (samples): subtract mean, divide by std
+        pb.set_message("Standardizing rows");
+        let stats: Vec<(f64, f64)> = (0..n_samples)
+            .into_par_iter()
+            .map(|i| {
+                let row = z.row(i);
+                let mean = row.sum() / n_valid_variants as f64;
+                let var = row
+                    .iter()
+                    .map(|&x| {
+                        let d = x - mean;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / (n_valid_variants - 1) as f64;
+                (mean, var.sqrt())
+            })
+            .collect();
+
         for i in 0..n_samples {
-            let sample_row = sample_data.row(i);
-            let mean = sample_row.sum() / n_valid_variants as f64;
-            sample_means[i] = mean;
-            
-            let variance = sample_row.iter()
-                .map(|&x| (x - mean).powi(2))
-                .sum::<f64>() / (n_valid_variants - 1) as f64;
-            sample_stds[i] = variance.sqrt();
-        }
-        
-        // Calculate correlation matrix
-        let _total_pairs = (n_samples * (n_samples + 1)) / 2;
-        let mut computed_pairs = 0;
-        
-        for i in 0..n_samples {
-            for j in i..n_samples {
-                // Calculate Pearson correlation for all pairs, including diagonal
-                let correlation = self.calculate_pearson_correlation(
-                    sample_data.row(i),
-                    sample_data.row(j),
-                    (sample_means[i], sample_stds[i]),
-                    (sample_means[j], sample_stds[j]),
-                    n_valid_variants,
-                );
-                
-                grm_matrix[[i, j]] = correlation;
-                if i != j {
-                    grm_matrix[[j, i]] = correlation; // Symmetric matrix
-                }
-                
-                computed_pairs += 1;
-                if computed_pairs % 10000 == 0 {
-                    pb.set_position(computed_pairs as u64);
-                }
+            let (mean, std_raw) = stats[i];
+            let std = std_raw.max(f64::EPSILON);
+            let mut row = z.row_mut(i);
+            for x in row.iter_mut() {
+                *x = (*x - mean) / std;
             }
         }
 
-        pb.finish_with_message("Correlation GRM calculation completed");
+        // Compute GRM = Z * Z^T / (m-1) using upper-triangular blocked parallel matmul
+        pb.set_message("Matrix multiply Z * Z^T (blocked upper-triangular)");
+        let z_t = z.t().to_owned();
+        let chunk: usize = std::env::var("DGRM_MM_CHUNK").ok()
+            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(512);
 
-        // Matrix is already filled in the loop above
+        // Prepare block coordinates for upper triangle (including diagonal)
+        let mut coords: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut rs = 0usize;
+        while rs < n_samples {
+            let re = (rs + chunk).min(n_samples);
+            let mut cs = rs;
+            while cs < n_samples {
+                let ce = (cs + chunk).min(n_samples);
+                coords.push((rs, re, cs, ce));
+                cs += chunk;
+            }
+            rs += chunk;
+        }
+
+        let parts: Vec<((usize, usize, usize, usize), ndarray::Array2<f64>)> = coords
+            .into_par_iter()
+            .map(|(rs, re, cs, ce)| {
+                let a = z.slice(s![rs..re, ..]);
+                let b = z_t.slice(s![.., cs..ce]);
+                let sub = a.dot(&b);
+                ((rs, re, cs, ce), sub)
+            })
+            .collect();
+
+        let mut grm_matrix = Array2::<f64>::zeros((n_samples, n_samples));
+        for ((rs, re, cs, ce), sub) in parts.into_iter() {
+            let rows = re - rs;
+            let cols = ce - cs;
+            // write upper block
+            for i in 0..rows {
+                for j in 0..cols {
+                    grm_matrix[[rs + i, cs + j]] = sub[[i, j]];
+                }
+            }
+            // mirror to lower block if off-diagonal
+            if cs != rs {
+                for i in 0..rows {
+                    for j in 0..cols {
+                        grm_matrix[[cs + j, rs + i]] = sub[[i, j]];
+                    }
+                }
+            }
+        }
+        let scale = 1.0 / (n_valid_variants.saturating_sub(1)) as f64;
+        grm_matrix.mapv_inplace(|x| x * scale);
+        for i in 0..n_samples { grm_matrix[[i, i]] = 1.0; }
+
+        pb.finish_with_message("GRM calculation completed");
 
         let calc_time = start_time.elapsed();
         log::info!("GRM calculation completed in {:.2} seconds", calc_time.as_secs_f64());
@@ -265,37 +298,6 @@ impl GrmCalculator {
 
 
 
-    /// Calculate Pearson correlation coefficient between two samples
-    /// This implementation matches R's cor() function exactly
-    fn calculate_pearson_correlation(
-        &self,
-        sample1: ndarray::ArrayView1<f64>,
-        sample2: ndarray::ArrayView1<f64>,
-        stats1: (f64, f64), // (mean, std_dev)
-        stats2: (f64, f64), // (mean, std_dev)
-        n_variants: usize,
-    ) -> f64 {
-        let (mean1, std1) = stats1;
-        let (mean2, std2) = stats2;
-
-        // Handle cases where standard deviation is zero (constant values)
-        if std1 == 0.0 || std2 == 0.0 {
-            return if (mean1 - mean2).abs() < f64::EPSILON { 1.0 } else { 0.0 };
-        }
-
-        // Calculate sample covariance using the standard formula
-        // Cov(X,Y) = E[(X - μX)(Y - μY)] = Σ(xi - μX)(yi - μY) / (n-1)
-        let covariance: f64 = sample1.iter()
-            .zip(sample2.iter())
-            .map(|(&x1, &x2)| (x1 - mean1) * (x2 - mean2))
-            .sum::<f64>() / (n_variants - 1) as f64; // Use sample covariance (n-1)
-
-        // Pearson correlation coefficient: r = Cov(X,Y) / (σX * σY)
-        let correlation = covariance / (std1 * std2);
-
-        // Clamp to [-1, 1] to handle numerical precision issues
-        correlation.max(-1.0).min(1.0)
-    }
 
     /// Extract upper triangular values for statistics calculation
     /// Uses column-major order to match GCTA/R expectations
@@ -416,7 +418,7 @@ impl GrmCalculator {
                         .flat_map(|i| {
                             let start_j_inner = if block_i == block_j { i.max(start_j) } else { start_j };
                             let variants_ref = valid_variants.clone();
-                            
+                            let afreqs = _allele_freqs.clone();
                             (start_j_inner..end_j).into_par_iter().map(move |j| {
                                 // Calculate Pearson correlation for all pairs (including diagonal)
                                 let mut sum_i = 0.0;
@@ -427,17 +429,17 @@ impl GrmCalculator {
                                 let mut count = 0;
                                 
                                 for &variant_idx in variants_ref.iter() {
-                                    let x_i = dosage_matrix[[i, variant_idx]];
-                                    let x_j = dosage_matrix[[j, variant_idx]];
-                                    
-                                    if x_i.is_finite() && !x_i.is_nan() && x_j.is_finite() && !x_j.is_nan() {
-                                        sum_i += x_i;
-                                        sum_j += x_j;
-                                        sum_ij += x_i * x_j;
-                                        sum_i2 += x_i * x_i;
-                                        sum_j2 += x_j * x_j;
-                                        count += 1;
-                                    }
+                                    let mean_val = afreqs[variant_idx] * 2.0;
+                                    let mut x_i = dosage_matrix[[i, variant_idx]];
+                                    let mut x_j = dosage_matrix[[j, variant_idx]];
+                                    if !x_i.is_finite() || x_i.is_nan() { x_i = mean_val; }
+                                    if !x_j.is_finite() || x_j.is_nan() { x_j = mean_val; }
+                                    sum_i += x_i;
+                                    sum_j += x_j;
+                                    sum_ij += x_i * x_j;
+                                    sum_i2 += x_i * x_i;
+                                    sum_j2 += x_j * x_j;
+                                    count += 1;
                                 }
                                 
                                 let grm_value = if count > 1 {
@@ -528,6 +530,7 @@ impl GrmMatrix {
     }
 
     /// Get number of variants
+    #[allow(dead_code)]
     pub fn n_variants(&self) -> usize {
         self.n_variants
     }
@@ -537,15 +540,22 @@ impl GrmMatrix {
         self.sample_ids.len()
     }
 
+
+    /// Get matrix value at (i, j)
+    pub fn value(&self, i: usize, j: usize) -> f64 {
+        self.matrix[[i, j]]
+    }
+
     /// Get upper triangular values (including diagonal) for GCTA format
-    /// Uses column-major order to match GCTA/R expectations
+    /// Uses column-major order to match GCTA dspMatrix format (uplo='U')
     pub fn upper_triangular_values(&self) -> Vec<f64> {
         let n = self.matrix.nrows();
         let mut values = Vec::with_capacity((n * (n + 1)) / 2);
         
-        // Column-major order: for each column j, add elements from row j to n-1
+        // GCTA uses column-major order for upper triangular: 
+        // for each column j, add elements from row 0 to j (upper triangle + diagonal)
         for j in 0..n {
-            for i in j..n {
+            for i in 0..=j {
                 values.push(self.matrix[[i, j]]);
             }
         }

@@ -11,9 +11,22 @@ anyhow = "1.0"
 thiserror = "1.0"
 indicatif = "0.17"
 rayon = "1.7"
-ndarray = "0.15"
+ndarray = { version = "0.15", default-features = false, features = ["std"] }
 csv = "1.2"
 byteorder = "1.4"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 env_logger = "0.10"
+bytemuck = "1.15"
+fast-float = "0.2"
+ 
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[features]
+default = []
