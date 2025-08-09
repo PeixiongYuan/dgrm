@@ -21,13 +21,10 @@ impl GctaWriter {
     /// Write GRM in GCTA format
     pub fn write_grm(&self, grm_matrix: &GrmMatrix, vntr_data: &VntrData) -> Result<()> {
         log::info!("Writing GCTA GRM files with prefix: {}", self.output_prefix);
-
-        // Calculate statistics
-        let stats = grm_matrix.calculate_stats();
-
-        // Write binary files
+        
+        // Write binary files (streaming I/O), compute stats while writing GRM values
         self.write_grm_n_bin(grm_matrix, vntr_data)?;
-        self.write_grm_bin(grm_matrix)?;
+        let stats = self.write_grm_bin(grm_matrix)?;
         
         // Write text files
         self.write_grm_id(grm_matrix.sample_ids())?;
@@ -45,16 +42,26 @@ impl GctaWriter {
     }
 
     /// Write number of variants per GRM element (4-byte FLOAT per element), row-major lower triangular
+    /// Stream in chunks to avoid allocating O(n^2) buffer
     fn write_grm_n_bin(&self, grm_matrix: &GrmMatrix, _vntr_data: &VntrData) -> Result<()> {
         let file_path = format!("{}.grm.N.bin", self.output_prefix);
         let file = File::create(&file_path)?;
-        let mut writer = BufWriter::new(file);
+        let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
 
         let n = grm_matrix.n_samples();
         let m = grm_matrix.n_variants() as f32;
         let len = n * (n + 1) / 2;
-        let buf = vec![m; len];
-        writer.write_all(cast_slice(&buf))?;
+        // Stream write constant value m
+        let chunk_elems: usize = 4_194_304; // ~16MB per chunk
+        let chunk: Vec<f32> = vec![m; chunk_elems];
+        let mut remaining = len;
+        while remaining >= chunk_elems {
+            writer.write_all(cast_slice(&chunk))?;
+            remaining -= chunk_elems;
+        }
+        if remaining > 0 {
+            writer.write_all(cast_slice(&chunk[..remaining]))?;
+        }
 
         writer.flush()?;
         log::debug!("Written per-pair N (float) in row-major lower-triangular order to {}", file_path);
@@ -62,23 +69,52 @@ impl GctaWriter {
     }
 
     /// Write GRM values as 4-byte floats, row-major lower-triangular (including diagonal)
-    fn write_grm_bin(&self, grm_matrix: &GrmMatrix) -> Result<()> {
+    /// Stream per-row to avoid allocating O(n^2) buffer, and compute stats on the fly
+    fn write_grm_bin(&self, grm_matrix: &GrmMatrix) -> Result<GrmStats> {
         let file_path = format!("{}.grm.bin", self.output_prefix);
         let file = File::create(&file_path)?;
-        let mut writer = BufWriter::new(file);
+        let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
 
         let n = grm_matrix.n_samples();
-        let mut buf = Vec::<f32>::with_capacity(n * (n + 1) / 2);
+        let mut count: usize = 0;
+        let mut mean: f64 = 0.0;  // Welford online mean
+        let mut m2: f64 = 0.0;    // Welford accumulated variance numerator
+        let mut min_val: f64 = f64::INFINITY;
+        let mut max_val: f64 = f64::NEG_INFINITY;
+
+        // Row-major lower triangular streaming
         for j in 0..n {
+            let mut row_buf: Vec<f32> = Vec::with_capacity(j + 1);
             for k in 0..=j {
-                buf.push(grm_matrix.value(j, k) as f32);
+                let v = grm_matrix.value(j, k);
+                // stats
+                count += 1;
+                let delta = v - mean;
+                mean += delta / (count as f64);
+                m2 += delta * (v - mean);
+                if v < min_val { min_val = v; }
+                if v > max_val { max_val = v; }
+                // buffer
+                row_buf.push(v as f32);
             }
+            writer.write_all(cast_slice(&row_buf))?;
         }
-        writer.write_all(cast_slice(&buf))?;
 
         writer.flush()?;
         log::debug!("Written GRM values (float) in row-major lower-triangular order to {}", file_path);
-        Ok(())
+
+        let n_elements = count;
+        let variance = if n_elements > 1 { m2 / (n_elements as f64) } else { 0.0 };
+        let stats = GrmStats {
+            n_variants: grm_matrix.n_variants(),
+            n_samples: n,
+            n_grm_elements: n_elements,
+            mean_kinship: mean,
+            sd_kinship: variance.sqrt(),
+            min_kinship: min_val,
+            max_kinship: max_val,
+        };
+        Ok(stats)
     }
 
     /// Write sample IDs in GCTA format (FID\tIID)

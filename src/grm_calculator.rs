@@ -5,7 +5,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::Array2;
 use ndarray::s;
 use rayon::prelude::*;
-use std::sync::Arc;
+use rayon::ThreadPoolBuilder;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// MAF filtering options
@@ -111,31 +112,33 @@ impl GrmCalculator {
 
         let dosage_matrix = vntr_data.dosage_matrix();
         
-        // Step 1: Calculate allele frequencies for each variant
+        // Step 1: Calculate allele frequencies for each variant (using a dedicated rayon pool)
         log::info!("Calculating allele frequencies for {} variants...", n_variants);
-        let allele_freqs: Vec<f64> = (0..n_variants)
-            .into_par_iter()
-            .map(|variant_idx| {
-                // Calculate allele frequency for this variant across all samples
-                let mut sum = 0.0;
-                let mut valid_count = 0;
-                
-                for sample_idx in 0..n_samples {
-                    let dosage = dosage_matrix[[sample_idx, variant_idx]];
-                    if !dosage.is_nan() && dosage.is_finite() {
-                        sum += dosage;
-                        valid_count += 1;
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(self.threads)
+            .build()
+            .expect("Failed to build rayon thread pool");
+        let allele_freqs: Vec<f64> = pool.install(|| {
+            (0..n_variants)
+                .into_par_iter()
+                .map(|variant_idx| {
+                    let mut sum = 0.0;
+                    let mut valid_count = 0;
+                    for sample_idx in 0..n_samples {
+                        let dosage = dosage_matrix[[sample_idx, variant_idx]];
+                        if dosage.is_finite() {
+                            sum += dosage;
+                            valid_count += 1;
+                        }
                     }
-                }
-                
-                if valid_count > 0 {
-                    // Allele frequency = mean dosage / 2 (since dosage is 0, 1, or 2)
-                    (sum / valid_count as f64) / 2.0
-                } else {
-                    0.5 // Default frequency if no valid data
-                }
-            })
-            .collect();
+                    if valid_count > 0 {
+                        (sum / valid_count as f64) / 2.0
+                    } else {
+                        0.5
+                    }
+                })
+                .collect()
+        });
         
         // Step 2: Filter variants based on MAF thresholds
         let min_maf = maf_filter.min_maf.unwrap_or(0.0);
@@ -167,53 +170,75 @@ impl GrmCalculator {
             ));
         }
 
-        // Build imputed data matrix for valid variants only
-        log::info!("Computing GRM via standardized matrix multiplication...");
-        pb.set_message("Building imputed matrix Z");
-        let mut z = Array2::<f64>::zeros((n_samples, n_valid_variants));
-        for (new_idx, &variant_idx) in valid_variants.iter().enumerate() {
-            let mean_val = allele_freqs[variant_idx] * 2.0;
-            for sample_idx in 0..n_samples {
-                let value = dosage_matrix[[sample_idx, variant_idx]];
-                z[[sample_idx, new_idx]] = if value.is_finite() && !value.is_nan() {
-                    value
+        // Build standardized matrix Z with empirical per-variant mean/std
+        // First compute empirical stats and filter low-variance columns
+        let std_epsilon: f64 = 1e-8;
+        log::info!("Standardization: empirical per-variant mean/std with variance filtering (std >= {}, count >= 2)", std_epsilon);
+        pb.set_message("Computing per-variant mean/std");
+        let variant_stats_all: Vec<(f64, f64, usize)> = valid_variants
+            .par_iter()
+            .map(|&variant_idx| {
+                let mut sum = 0.0f64;
+                let mut sumsq = 0.0f64;
+                let mut count: usize = 0;
+                for sample_idx in 0..n_samples {
+                    let v = dosage_matrix[[sample_idx, variant_idx]];
+                    if v.is_finite() {
+                        sum += v;
+                        sumsq += v * v;
+                        count += 1;
+                    }
+                }
+                if count >= 2 {
+                    let mean = sum / count as f64;
+                    let var = (sumsq - sum * sum / count as f64) / (count - 1) as f64;
+                    (mean, var.sqrt(), count)
+                } else if count == 1 {
+                    // Single observation
+                    let mean = sum;
+                    (mean, 0.0, count)
                 } else {
-                    mean_val
-                };
-            }
-        }
-
-        // Standardize rows (samples): subtract mean, divide by std
-        pb.set_message("Standardizing rows");
-        let stats: Vec<(f64, f64)> = (0..n_samples)
-            .into_par_iter()
-            .map(|i| {
-                let row = z.row(i);
-                let mean = row.sum() / n_valid_variants as f64;
-                let var = row
-                    .iter()
-                    .map(|&x| {
-                        let d = x - mean;
-                        d * d
-                    })
-                    .sum::<f64>()
-                    / (n_valid_variants - 1) as f64;
-                (mean, var.sqrt())
+                    (0.0, 0.0, 0)
+                }
             })
             .collect();
 
-        for i in 0..n_samples {
-            let (mean, std_raw) = stats[i];
-            let std = std_raw.max(f64::EPSILON);
-            let mut row = z.row_mut(i);
-            for x in row.iter_mut() {
-                *x = (*x - mean) / std;
+        // Filter effective variants by std and count
+        let mut effective_indices: Vec<usize> = Vec::new();
+        let mut variant_stats: Vec<(f64, f64)> = Vec::new();
+        for (pos, &vidx) in valid_variants.iter().enumerate() {
+            let (mean_k, std_k, cnt_k) = variant_stats_all[pos];
+            if cnt_k >= 2 && std_k >= std_epsilon {
+                effective_indices.push(vidx);
+                variant_stats.push((mean_k, std_k));
+            }
+        }
+        let m_effective = effective_indices.len();
+        if m_effective == 0 {
+            return Err(crate::error::DgrmError::InvalidFormat(
+                "No informative variants after variance filtering".to_string()
+            ));
+        }
+        log::info!("Effective variants after variance filter: {} (from {} after MAF)", m_effective, n_valid_variants);
+
+        pb.set_message("Building standardized matrix Z");
+        let mut z = Array2::<f64>::zeros((n_samples, m_effective));
+        for sample_idx in 0..n_samples {
+            let mut row = z.row_mut(sample_idx);
+            for (new_idx, &variant_idx) in effective_indices.iter().enumerate() {
+                let v = dosage_matrix[[sample_idx, variant_idx]];
+                if v.is_finite() {
+                    let (mean_k, std_k) = variant_stats[new_idx];
+                    row[new_idx] = (v - mean_k) / std_k;
+                } else {
+                    row[new_idx] = 0.0;
+                }
             }
         }
 
         // Compute GRM = Z * Z^T / (m-1) using upper-triangular blocked parallel matmul
         pb.set_message("Matrix multiply Z * Z^T (blocked upper-triangular)");
-        let z_t = z.t().to_owned();
+        let z_t = z.view().reversed_axes();
         let chunk: usize = std::env::var("DGRM_MM_CHUNK").ok()
             .and_then(|v| v.parse::<usize>().ok()).unwrap_or(512);
 
@@ -231,38 +256,26 @@ impl GrmCalculator {
             rs += chunk;
         }
 
-        let parts: Vec<((usize, usize, usize, usize), ndarray::Array2<f64>)> = coords
-            .into_par_iter()
-            .map(|(rs, re, cs, ce)| {
+        use std::sync::Mutex;
+        let grm_matrix_arc = Arc::new(Mutex::new(Array2::<f64>::zeros((n_samples, n_samples))));
+        pool.install(|| {
+            coords.into_par_iter().for_each(|(rs, re, cs, ce)| {
                 let a = z.slice(s![rs..re, ..]);
                 let b = z_t.slice(s![.., cs..ce]);
                 let sub = a.dot(&b);
-                ((rs, re, cs, ce), sub)
-            })
-            .collect();
-
-        let mut grm_matrix = Array2::<f64>::zeros((n_samples, n_samples));
-        for ((rs, re, cs, ce), sub) in parts.into_iter() {
-            let rows = re - rs;
-            let cols = ce - cs;
-            // write upper block
-            for i in 0..rows {
-                for j in 0..cols {
-                    grm_matrix[[rs + i, cs + j]] = sub[[i, j]];
+                let mut guard = grm_matrix_arc.lock().unwrap();
+                guard.slice_mut(s![rs..re, cs..ce]).assign(&sub);
+                if cs != rs {
+                    guard.slice_mut(s![cs..ce, rs..re]).assign(&sub.t());
                 }
-            }
-            // mirror to lower block if off-diagonal
-            if cs != rs {
-                for i in 0..rows {
-                    for j in 0..cols {
-                        grm_matrix[[cs + j, rs + i]] = sub[[i, j]];
-                    }
-                }
-            }
-        }
-        let scale = 1.0 / (n_valid_variants.saturating_sub(1)) as f64;
+            });
+        });
+        let mut grm_matrix = Arc::try_unwrap(grm_matrix_arc)
+            .expect("Multiple references to grm_matrix remain")
+            .into_inner()
+            .expect("Mutex poisoned");
+        let scale = 1.0 / (m_effective.max(1)) as f64;
         grm_matrix.mapv_inplace(|x| x * scale);
-        for i in 0..n_samples { grm_matrix[[i, i]] = 1.0; }
 
         pb.finish_with_message("GRM calculation completed");
 
@@ -292,7 +305,7 @@ impl GrmCalculator {
         Ok(GrmMatrix {
             matrix: grm_matrix,
             sample_ids: vntr_data.sample_ids().to_vec(),
-            n_variants: n_valid_variants, // Use valid variant count
+            n_variants: m_effective, // Use effective variant count
         })
     }
 
@@ -331,7 +344,7 @@ impl GrmCalculator {
         log::info!("Using {} blocks, {} block pairs to compute", n_blocks, total_block_pairs);
         
         // Initialize result matrix (this is the main memory consumer)
-        let mut grm_matrix = Array2::<f64>::zeros((n_samples, n_samples));
+        let grm_matrix = Arc::new(Mutex::new(Array2::<f64>::zeros((n_samples, n_samples))));
         let dosage_matrix = vntr_data.dosage_matrix();
         
         // Calculate allele frequencies and filter variants (same as main algorithm)
@@ -389,7 +402,6 @@ impl GrmCalculator {
         }
         
         let valid_variants = Arc::new(valid_variants);
-        let _allele_freqs = Arc::new(allele_freqs);
         
         // Progress tracking
         let pb = ProgressBar::new(total_block_pairs as u64);
@@ -399,93 +411,92 @@ impl GrmCalculator {
             .progress_chars("#>-"));
         pb.set_message("Processing blocks");
 
-        // Process blocks with aggressive memory management
-        for block_i in 0..n_blocks {
-            for block_j in block_i..n_blocks {
+        // Use empirical per-variant standardization; no per-sample stats needed
+        log::info!("Standardization: empirical per-variant mean/std");
+
+        // Anti-diagonal waves to ensure disjoint writes; parallelize within each wave
+        for d in 0..n_blocks {
+            let pairs: Vec<(usize, usize)> = (0..(n_blocks - d)).map(|i| (i, i + d)).collect();
+            pairs.into_par_iter().for_each(|(block_i, block_j)| {
                 let start_i = block_i * block_size;
                 let end_i = (start_i + block_size).min(n_samples);
                 let start_j = block_j * block_size;
                 let end_j = (start_j + block_size).min(n_samples);
 
-                // Process smaller sub-blocks within each block to reduce peak memory
-                let sub_block_size = 512; // Process in 512-sample chunks
-                for sub_i_start in (start_i..end_i).step_by(sub_block_size) {
-                    let sub_i_end = (sub_i_start + sub_block_size).min(end_i);
-                    
-                    // Collect GRM values for this sub-block
-                    let sub_block_grm_values: Vec<((usize, usize), f64)> = (sub_i_start..sub_i_end)
-                        .into_par_iter()
-                        .flat_map(|i| {
-                            let start_j_inner = if block_i == block_j { i.max(start_j) } else { start_j };
-                            let variants_ref = valid_variants.clone();
-                            let afreqs = _allele_freqs.clone();
-                            (start_j_inner..end_j).into_par_iter().map(move |j| {
-                                // Calculate Pearson correlation for all pairs (including diagonal)
-                                let mut sum_i = 0.0;
-                                let mut sum_j = 0.0;
-                                let mut sum_ij = 0.0;
-                                let mut sum_i2 = 0.0;
-                                let mut sum_j2 = 0.0;
-                                let mut count = 0;
-                                
-                                for &variant_idx in variants_ref.iter() {
-                                    let mean_val = afreqs[variant_idx] * 2.0;
-                                    let mut x_i = dosage_matrix[[i, variant_idx]];
-                                    let mut x_j = dosage_matrix[[j, variant_idx]];
-                                    if !x_i.is_finite() || x_i.is_nan() { x_i = mean_val; }
-                                    if !x_j.is_finite() || x_j.is_nan() { x_j = mean_val; }
-                                    sum_i += x_i;
-                                    sum_j += x_j;
-                                    sum_ij += x_i * x_j;
-                                    sum_i2 += x_i * x_i;
-                                    sum_j2 += x_j * x_j;
-                                    count += 1;
-                                }
-                                
-                                let grm_value = if count > 1 {
-                                    let n = count as f64;
-                                    let numerator = n * sum_ij - sum_i * sum_j;
-                                    let denom_i = n * sum_i2 - sum_i * sum_i;
-                                    let denom_j = n * sum_j2 - sum_j * sum_j;
-                                    
-                                    if denom_i > 0.0 && denom_j > 0.0 {
-                                        numerator / (denom_i * denom_j).sqrt()
-                                    } else {
-                                        // Handle zero variance case
-                                        if i == j { 1.0 } else { 0.0 }
-                                    }
-                                } else {
-                                    // Not enough data
-                                    if i == j { 1.0 } else { 0.0 }
-                                };
-                                ((i, j), grm_value)
-                            })
-                        })
-                        .collect();
-
-                    // Immediately write results and drop temporary data
-                    for ((i, j), grm_value) in sub_block_grm_values {
-                        grm_matrix[[i, j]] = grm_value;
-                        if i != j {
-                            grm_matrix[[j, i]] = grm_value; // Symmetric
+                // Build Z blocks for I and J using per-variant standardization
+                let rows_i = end_i - start_i;
+                let rows_j = end_j - start_j;
+                // Pre-compute empirical mean/std per variant once and filter low-variance
+                let std_epsilon: f64 = 1e-8;
+                let stats_all: Vec<(f64, f64, usize)> = valid_variants
+                    .iter()
+                    .map(|&variant_idx| {
+                        let mut sum = 0.0f64;
+                        let mut sumsq = 0.0f64;
+                        let mut count: usize = 0;
+                        for i in 0..n_samples {
+                            let v = dosage_matrix[[i, variant_idx]];
+                            if v.is_finite() {
+                                sum += v;
+                                sumsq += v * v;
+                                count += 1;
+                            }
                         }
+                        if count >= 2 {
+                            let mean = sum / count as f64;
+                            let var = (sumsq - sum * sum / count as f64) / (count - 1) as f64;
+                            (mean, var.sqrt(), count)
+                        } else if count == 1 {
+                            let mean = sum;
+                            (mean, 0.0, count)
+                        } else {
+                            (0.0, 0.0, 0)
+                        }
+                    })
+                    .collect();
+
+                let mut eff_indices: Vec<usize> = Vec::new();
+                let mut stats: Vec<(f64, f64)> = Vec::new();
+                for (pos, &vidx) in valid_variants.iter().enumerate() {
+                    let (mean_k, std_k, cnt_k) = stats_all[pos];
+                    if cnt_k >= 2 && std_k >= std_epsilon {
+                        eff_indices.push(vidx);
+                        stats.push((mean_k, std_k));
                     }
-                    // sub_block_grm_values is dropped here, freeing memory
                 }
-                
+
+                let m = eff_indices.len();
+                let mut z_i = Array2::<f64>::zeros((rows_i, m));
+                let mut z_j = Array2::<f64>::zeros((rows_j, m));
+
+                for (k, &variant_idx) in eff_indices.iter().enumerate() {
+                    let (mean_k, std_k) = stats[k];
+                    for (local_r, i) in (start_i..end_i).enumerate() {
+                        let x = dosage_matrix[[i, variant_idx]];
+                        z_i[[local_r, k]] = if x.is_finite() { (x - mean_k) / std_k } else { 0.0 };
+                    }
+                    for (local_r, j) in (start_j..end_j).enumerate() {
+                        let x = dosage_matrix[[j, variant_idx]];
+                        z_j[[local_r, k]] = if x.is_finite() { (x - mean_k) / std_k } else { 0.0 };
+                    }
+                }
+
+                // Multiply: sub = Z_I * Z_J^T
+                let sub = z_i.dot(&z_j.t());
+
+                // Write upper and mirror to lower if needed
+                let mut guard = grm_matrix.lock().unwrap();
+                guard
+                    .slice_mut(s![start_i..end_i, start_j..end_j])
+                    .assign(&sub);
+                if block_i != block_j {
+                    guard
+                        .slice_mut(s![start_j..end_j, start_i..end_i])
+                        .assign(&sub.t());
+                }
+
                 pb.inc(1);
-                
-                // Progress reporting and memory cleanup hints
-                if (block_i * n_blocks + block_j) % 5 == 0 {
-                    let progress_pct = (block_i * n_blocks + block_j + 1) as f64 / total_block_pairs as f64 * 100.0;
-                    log::info!("Processed block pair ({}, {}) - {:.1}% complete", block_i, block_j, progress_pct);
-                    
-                    // Suggest garbage collection more frequently for large datasets
-                    if n_samples > 40000 {
-                        std::hint::black_box(&grm_matrix); // Prevent over-optimization
-                    }
-                }
-            }
+            });
         }
 
         pb.finish_with_message("Block-wise calculation completed");
@@ -493,6 +504,14 @@ impl GrmCalculator {
         let calc_time = start_time.elapsed();
         log::info!("Block-wise GRM calculation completed in {:.2} seconds", calc_time.as_secs_f64());
 
+        // Scale by 1/m (no diagonal normalization)
+        let mut grm_matrix = Arc::try_unwrap(grm_matrix)
+            .expect("Multiple references to grm_matrix remain")
+            .into_inner()
+            .expect("Mutex poisoned");
+        let scale = 1.0 / (valid_variants.len().max(1)) as f64;
+        grm_matrix.mapv_inplace(|x| x * scale);
+        
         // Calculate statistics efficiently
         let upper_triangular = self.extract_upper_triangular(&grm_matrix);
         let n_elements = upper_triangular.len();
@@ -516,7 +535,7 @@ impl GrmCalculator {
         Ok(GrmMatrix {
             matrix: grm_matrix,
             sample_ids: vntr_data.sample_ids().to_vec(),
-            n_variants: n_valid_variants, // Use valid variant count
+            n_variants: valid_variants.len(),
         })
     }
 
@@ -546,47 +565,7 @@ impl GrmMatrix {
         self.matrix[[i, j]]
     }
 
-    /// Get upper triangular values (including diagonal) for GCTA format
-    /// Uses column-major order to match GCTA dspMatrix format (uplo='U')
-    pub fn upper_triangular_values(&self) -> Vec<f64> {
-        let n = self.matrix.nrows();
-        let mut values = Vec::with_capacity((n * (n + 1)) / 2);
-        
-        // GCTA uses column-major order for upper triangular: 
-        // for each column j, add elements from row 0 to j (upper triangle + diagonal)
-        for j in 0..n {
-            for i in 0..=j {
-                values.push(self.matrix[[i, j]]);
-            }
-        }
-        
-        values
-    }
-
-    /// Calculate basic statistics
-    pub fn calculate_stats(&self) -> GrmStats {
-        let values = self.upper_triangular_values();
-        let n_elements = values.len();
-        
-        let mean = values.iter().sum::<f64>() / n_elements as f64;
-        let variance = values.iter()
-            .map(|&x| (x - mean).powi(2))
-            .sum::<f64>() / n_elements as f64;
-        let std_dev = variance.sqrt();
-        
-        let min_val = values.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-        let max_val = values.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        
-        GrmStats {
-            n_variants: self.n_variants,
-            n_samples: self.n_samples(),
-            n_grm_elements: n_elements,
-            mean_kinship: mean,
-            sd_kinship: std_dev,
-            min_kinship: min_val,
-            max_kinship: max_val,
-        }
-    }
+    
 }
 
 #[derive(Debug, Clone)]
