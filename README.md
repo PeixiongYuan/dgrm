@@ -5,9 +5,8 @@ DGRM computes Genetic Relationship Matrices (GRM) from VNTR scaled dosage data. 
 ## Highlights
 - Multi-threaded core with automatic block-wise computation for large N
 - Empirical per-variant standardization with low-variance filtering
-- Robust handling of missing values (treated as 0 after standardization)
 - GCTA-compatible outputs: `.grm.bin`, `.grm.id`, `.grm.summary`, `.grm.N.bin`
-- Detailed logging and progress reporting
+
 
 ## Build
 ```bash
@@ -22,16 +21,13 @@ cargo build --release
   --input <FILE> \
   --output <PREFIX> \
   --threads <N> \
-  [--maf <FREQ>] [--max-maf <FREQ>] [--keep <KEEP_FILE>]
+  [--keep <KEEP_FILE>]
 ```
 
 Examples:
 ```bash
 # Basic run
 ./target/release/dgrm --input chr1_vntr_scaled_dos.txt --output chr1_grm --threads 8
-
-# With MAF thresholds
-./target/release/dgrm --input data.txt --output out --threads 16 --maf 0.01 --max-maf 0.99
 
 # Keep a subset of samples (FID IID or single-column file)
 ./target/release/dgrm --input data.txt --output out --threads 8 --keep keep.txt

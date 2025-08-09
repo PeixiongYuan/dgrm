@@ -8,7 +8,6 @@ mod grm_calculator;
 mod gcta_writer;
 mod error;
 
-use grm_calculator::MafFilter;
 
 use cli::Args;
 use data_io::{VntrData, read_keep_file};
@@ -47,31 +46,13 @@ fn main() -> Result<()> {
         );
     }
     
-    // Prepare MAF filter
-    let maf_filter = if args.maf.is_some() || args.max_maf.is_some() {
-        Some(MafFilter {
-            min_maf: args.maf,
-            max_maf: args.max_maf,
-        })
-    } else {
-        None
-    };
-
-    if let Some(ref filter) = maf_filter {
-        if let Some(min_maf) = filter.min_maf {
-            log::info!("Applying minimum MAF filter: {:.4}", min_maf);
-        }
-        if let Some(max_maf) = filter.max_maf {
-            log::info!("Applying maximum MAF filter: {:.4}", max_maf);
-        }
-    } else {
-        log::info!("No MAF filtering applied");
-    }
+    // No MAF filtering
+    log::info!("No MAF filtering (parameter removed)");
 
     // Calculate GRM
     log::info!("Calculating GRM matrix...");
     let calculator = GrmCalculator::new(args.threads);
-    let grm_matrix = calculator.calculate_grm(&vntr_data, maf_filter)?;
+    let grm_matrix = calculator.calculate_grm(&vntr_data)?;
     
     // Write GCTA format files
     log::info!("Writing GCTA format files...");

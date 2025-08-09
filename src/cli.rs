@@ -58,22 +58,6 @@ pub struct Args {
     )]
     pub threads: usize,
 
-    /// Minimum minor allele frequency threshold
-    #[arg(
-        long = "maf",
-        value_name = "FREQ",
-        help = "Minimum MAF threshold (e.g., 0.01 to exclude variants with MAF < 1%)"
-    )]
-    pub maf: Option<f64>,
-
-    /// Maximum minor allele frequency threshold  
-    #[arg(
-        long = "max-maf",
-        value_name = "FREQ",
-        help = "Maximum MAF threshold (e.g., 0.99 to exclude variants with MAF > 99%)"
-    )]
-    pub max_maf: Option<f64>,
-
     /// Keep only samples listed in this file (two columns: FID IID or single column)
     #[arg(
         long = "keep",

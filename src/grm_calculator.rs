@@ -9,21 +9,7 @@ use rayon::ThreadPoolBuilder;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// MAF filtering options
-#[derive(Debug, Clone)]
-pub struct MafFilter {
-    pub min_maf: Option<f64>,
-    pub max_maf: Option<f64>,
-}
-
-impl Default for MafFilter {
-    fn default() -> Self {
-        Self {
-            min_maf: None,
-            max_maf: None,
-        }
-    }
-}
+// MAF filtering removed
 
 pub struct GrmCalculator {
     threads: usize,
@@ -45,13 +31,13 @@ impl GrmCalculator {
     }
 
     /// Calculate GRM matrix using standard genetic relationship matrix formula
-    /// GRM_ij = (1/M) × Σ_k [(x_ik - 2p_k)(x_jk - 2p_k)] / [2p_k(1-p_k)]
-    pub fn calculate_grm(&self, vntr_data: &VntrData, maf_filter: Option<MafFilter>) -> Result<GrmMatrix> {
-        self.calculate_grm_with_filter(vntr_data, maf_filter.unwrap_or_default())
+    /// equivalently: let z_ik = (x_ik - μ_k) / σ_k, then GRM = (1/m) · Z · Z^T
+    pub fn calculate_grm(&self, vntr_data: &VntrData) -> Result<GrmMatrix> {
+        self.calculate_grm_no_maf(vntr_data)
     }
 
-    /// Calculate GRM with MAF filtering
-    fn calculate_grm_with_filter(&self, vntr_data: &VntrData, maf_filter: MafFilter) -> Result<GrmMatrix> {
+    /// Calculate GRM without any MAF filtering
+    fn calculate_grm_no_maf(&self, vntr_data: &VntrData) -> Result<GrmMatrix> {
         let start_time = Instant::now();
         let n_samples = vntr_data.n_samples();
         let n_variants = vntr_data.n_variants();
@@ -96,7 +82,7 @@ impl GrmCalculator {
             let max_samples_per_block = ((max_grm_elements as f64).sqrt() as usize).max(1024).min(4096); // 1K-4K range
             
             log::info!("Block size: {} samples per block (target memory: {:.1} GB)", max_samples_per_block, target_memory_gb);
-            return self.calculate_grm_blockwise(vntr_data, max_samples_per_block, maf_filter);
+            return self.calculate_grm_blockwise(vntr_data, max_samples_per_block);
         } else if total_estimated_mb > 15 * 1024 { // > 15GB, warn but continue  
             log::warn!("⚠️  MODERATE MEMORY WARNING: Estimated usage {:.1} GB", total_estimated_mb as f64 / 1024.0);
             log::warn!("⚠️  Actual usage may be higher - consider monitoring system memory");
@@ -112,63 +98,19 @@ impl GrmCalculator {
 
         let dosage_matrix = vntr_data.dosage_matrix();
         
-        // Step 1: Calculate allele frequencies for each variant (using a dedicated rayon pool)
-        log::info!("Calculating allele frequencies for {} variants...", n_variants);
+        // Prepare dedicated rayon pool for downstream parallel sections
         let pool = ThreadPoolBuilder::new()
             .num_threads(self.threads)
             .build()
             .expect("Failed to build rayon thread pool");
-        let allele_freqs: Vec<f64> = pool.install(|| {
-            (0..n_variants)
-                .into_par_iter()
-                .map(|variant_idx| {
-                    let mut sum = 0.0;
-                    let mut valid_count = 0;
-                    for sample_idx in 0..n_samples {
-                        let dosage = dosage_matrix[[sample_idx, variant_idx]];
-                        if dosage.is_finite() {
-                            sum += dosage;
-                            valid_count += 1;
-                        }
-                    }
-                    if valid_count > 0 {
-                        (sum / valid_count as f64) / 2.0
-                    } else {
-                        0.5
-                    }
-                })
-                .collect()
-        });
         
-        // Step 2: Filter variants based on MAF thresholds
-        let min_maf = maf_filter.min_maf.unwrap_or(0.0);
-        let max_maf = maf_filter.max_maf.unwrap_or(1.0);
-        
-        let valid_variants: Vec<usize> = allele_freqs
-            .iter()
-            .enumerate()
-            .filter(|(_, &freq)| {
-                // Calculate MAF (minor allele frequency)
-                let maf = freq.min(1.0 - freq);
-                maf >= min_maf && maf <= max_maf
-            })
-            .map(|(idx, _)| idx)
-            .collect();
-        
+        // Step 2: Do not filter by MAF; proceed with all variants
+        let valid_variants: Vec<usize> = (0..n_variants).collect();
         let n_valid_variants = valid_variants.len();
-        if maf_filter.min_maf.is_some() || maf_filter.max_maf.is_some() {
-            log::info!("Using {} valid variants (MAF: {:.4} - {:.4}) out of {} total variants", 
-                       n_valid_variants, min_maf, max_maf, n_variants);
-        } else {
-            log::info!("Using {} variants (no MAF filtering) out of {} total variants", 
-                       n_valid_variants, n_variants);
-        }
-        
-        if n_valid_variants == 0 {
-            return Err(crate::error::DgrmError::InvalidFormat(
-                "No valid variants found (all variants are monomorphic)".to_string()
-            ));
-        }
+        log::info!(
+            "Using {} variants (MAF filtering disabled)",
+            n_valid_variants
+        );
 
         // Build standardized matrix Z with empirical per-variant mean/std
         // First compute empirical stats and filter low-variance columns
@@ -219,7 +161,7 @@ impl GrmCalculator {
                 "No informative variants after variance filtering".to_string()
             ));
         }
-        log::info!("Effective variants after variance filter: {} (from {} after MAF)", m_effective, n_valid_variants);
+        log::info!("Effective variants after variance filter: {} (from {} total)", m_effective, n_valid_variants);
 
         pb.set_message("Building standardized matrix Z");
         let mut z = Array2::<f64>::zeros((n_samples, m_effective));
@@ -329,7 +271,7 @@ impl GrmCalculator {
     }
 
     /// Memory-efficient block-wise GRM calculation for large datasets
-    pub fn calculate_grm_blockwise(&self, vntr_data: &VntrData, block_size: usize, maf_filter: MafFilter) -> Result<GrmMatrix> {
+    pub fn calculate_grm_blockwise(&self, vntr_data: &VntrData, block_size: usize) -> Result<GrmMatrix> {
         let start_time = Instant::now();
         let n_samples = vntr_data.n_samples();
         let n_variants = vntr_data.n_variants();
@@ -347,59 +289,12 @@ impl GrmCalculator {
         let grm_matrix = Arc::new(Mutex::new(Array2::<f64>::zeros((n_samples, n_samples))));
         let dosage_matrix = vntr_data.dosage_matrix();
         
-        // Calculate allele frequencies and filter variants (same as main algorithm)
-        log::info!("Calculating allele frequencies for {} variants...", n_variants);
-        let allele_freqs: Vec<f64> = (0..n_variants)
-            .into_par_iter()
-            .map(|variant_idx| {
-                let mut sum = 0.0;
-                let mut valid_count = 0;
-                
-                for sample_idx in 0..n_samples {
-                    let dosage = dosage_matrix[[sample_idx, variant_idx]];
-                    if !dosage.is_nan() && dosage.is_finite() {
-                        sum += dosage;
-                        valid_count += 1;
-                    }
-                }
-                
-                if valid_count > 0 {
-                    (sum / valid_count as f64) / 2.0
-                } else {
-                    0.5
-                }
-            })
-            .collect();
+        // No allele frequency computation needed for MAF filtering
         
-        // Filter variants based on MAF thresholds
-        let min_maf = maf_filter.min_maf.unwrap_or(0.0);
-        let max_maf = maf_filter.max_maf.unwrap_or(1.0);
-        
-        let valid_variants: Vec<usize> = allele_freqs
-            .iter()
-            .enumerate()
-            .filter(|(_, &freq)| {
-                // Calculate MAF (minor allele frequency)
-                let maf = freq.min(1.0 - freq);
-                maf >= min_maf && maf <= max_maf
-            })
-            .map(|(idx, _)| idx)
-            .collect();
-        
+        // No MAF filtering; use all variants
+        let valid_variants: Vec<usize> = (0..n_variants).collect();
         let n_valid_variants = valid_variants.len();
-        if maf_filter.min_maf.is_some() || maf_filter.max_maf.is_some() {
-            log::info!("Using {} valid variants (MAF: {:.4} - {:.4}) out of {} total variants", 
-                       n_valid_variants, min_maf, max_maf, n_variants);
-        } else {
-            log::info!("Using {} variants (no MAF filtering) out of {} total variants", 
-                       n_valid_variants, n_variants);
-        }
-        
-        if n_valid_variants == 0 {
-            return Err(crate::error::DgrmError::InvalidFormat(
-                "No valid variants found (all variants are monomorphic)".to_string()
-            ));
-        }
+        log::info!("Using {} variants (MAF filtering disabled)", n_valid_variants);
         
         let valid_variants = Arc::new(valid_variants);
         
