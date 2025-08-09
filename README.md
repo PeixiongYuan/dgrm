@@ -1,73 +1,76 @@
-### DGRM — Parallel VNTR GRM Calculator (Rust)
+## DGRM — Parallel GRM for VNTR (Rust)
 
-DGRM is a high-performance Genetic Relationship Matrix (GRM) calculator for VNTR (Variable Number Tandem Repeat) scaled dosage data, implemented in Rust. It produces GCTA-compatible outputs and is optimized for multi-threaded execution and large cohorts.
+DGRM computes Genetic Relationship Matrices (GRM) from VNTR scaled dosage data. It is optimized for large cohorts, multi-threaded execution, and produces GCTA-compatible outputs.
 
-### Features
-- High-throughput, multi-threaded computation via Rayon
-- Memory-aware block-wise algorithm for large N (auto-enabled on big inputs)
-- GCTA-compatible outputs (.grm.bin, .grm.id, .grm.summary)
-- Optional MAF filtering (min and/or max)
-- Informative progress logging and summary statistics
+## Highlights
+- Multi-threaded core with automatic block-wise computation for large N
+- Empirical per-variant standardization with low-variance filtering
+- Robust handling of missing values (treated as 0 after standardization)
+- GCTA-compatible outputs: `.grm.bin`, `.grm.id`, `.grm.summary`, `.grm.N.bin`
+- Detailed logging and progress reporting
 
-### Build
+## Build
 ```bash
 cd dgrm
 cargo build --release
 ./target/release/dgrm --help
 ```
 
-### Usage
+## Usage
 ```bash
-dgrm \
+./target/release/dgrm \
   --input <FILE> \
   --output <PREFIX> \
   --threads <N> \
-  [--maf <FREQ>] [--max-maf <FREQ>]
+  [--maf <FREQ>] [--max-maf <FREQ>] [--keep <KEEP_FILE>]
 ```
 
 Examples:
 ```bash
 # Basic run
-dgrm --input chr1_vntr_scaled_dos.txt --output chr1_grm --threads 8
+./target/release/dgrm --input chr1_vntr_scaled_dos.txt --output chr1_grm --threads 8
 
-# With MAF filtering
-dgrm --input data.txt --output out --threads 16 --maf 0.01 --max-maf 0.99
+# With MAF thresholds
+./target/release/dgrm --input data.txt --output out --threads 16 --maf 0.01 --max-maf 0.99
+
+# Keep a subset of samples (FID IID or single-column file)
+./target/release/dgrm --input data.txt --output out --threads 8 --keep keep.txt
 ```
 
-### Input Format
-Tab-delimited text without header:
+## Input format
+Tab-delimited, no header:
 ```
-sample1    0.23    1.45    0.78   ...
-sample2    1.12    0.89    1.23   ...
-sample3    0.45    2.01    0.67   ...
+sample1	0.23	1.45	0.78	...
+sample2	1.12	0.89	1.23	...
+sample3	0.45	2.01	0.67	...
 ```
-- First column: sample ID
-- Remaining columns: scaled dosage per variant
-- Rows = samples, columns = variants
+- Column 1: sample ID
+- Columns 2..M: VNTR scaled dosage per variant (not necessarily 0/1/2)
+- Rows are samples
 
-### Output Files (GCTA-compatible)
-- `<prefix>.grm.bin`: GRM values as float32 in column-major upper-triangular order (including diagonal)
-- `<prefix>.grm.id`: sample IDs (two identical columns: FID, IID)
-- `<prefix>.grm.summary`: summary statistics (text)
-- `<prefix>.grm.N.bin`: number of variants used (4-byte integer)
+## Method (concise)
+- Empirical standardization per variant: for variant k, compute mean μ_k and sample std σ_k over finite values; set z[i,k] = (x[i,k] − μ_k)/σ_k; missing values become 0.
+- Filter variants with low information: keep only σ_k ≥ 1e−8 and count ≥ 2; let m be the number of kept variants.
+- Compute GRM: G = (Z · Zᵀ) / m. For very large N, G is built block-wise.
 
-Compatibility note:
-- Some GCTA workflows expect `<prefix>.grm.N.bin` to contain per-pair counts in the same order as `<prefix>.grm.bin`. This tool currently writes a single total-variant count. The `.grm.bin` ordering is GCTA-conformant.
+## Outputs (GCTA-compatible)
+- `<prefix>.grm.bin`: GRM values as float32 in row-major lower-triangular order (including diagonal)
+- `<prefix>.grm.N.bin`: number of variants used (float32, constant m for all pairs)
+- `<prefix>.grm.id`: sample IDs (two columns: FID, IID)
+- `<prefix>.grm.summary`: summary statistics
 
-### Performance & Memory
-- Full in-memory GRM requires ~N^2 × 8 bytes (float64). For very large N, the tool automatically switches to a memory-efficient block-wise correlation algorithm and writes into the final matrix incrementally.
-- Ordering of values in `.grm.bin` matches GCTA: column-major, upper triangle (including diagonal).
-- Set threads with `--threads`. Typical best throughput is near the number of physical cores.
+Note: This tool writes `.grm.bin` in the standard row-major lower-triangular order commonly accepted by GCTA utilities.
 
-### Logging
-Use environment variable to increase verbosity:
+## Performance & memory
+- Full GRM in memory uses ~ N² × 8 bytes (f64). The tool automatically switches to a block-wise algorithm for large N.
+- Set threads via `--threads`. Throughput typically scales near physical core count.
+- For extra speed, set `RUST_LOG=info` and consider tuning `DGRM_MM_CHUNK` (e.g., 256/512/1024).
+
+## Logging
 ```bash
 RUST_LOG=info ./target/release/dgrm --input data.txt --output result --threads 8 | cat
 RUST_LOG=debug ./target/release/dgrm --input data.txt --output result --threads 8 | cat
 ```
 
-### License
+## License
 MIT
-
-### Version
-0.1.0
