@@ -1,4 +1,4 @@
-## DGRM — Parallel GRM for VNTR (Rust)
+## DGRM — Parallel GRM for VNTR
 
 DGRM computes Genetic Relationship Matrices (GRM) from VNTR scaled dosage data. It is optimized for large cohorts, multi-threaded execution, and produces GCTA-compatible outputs.
 
