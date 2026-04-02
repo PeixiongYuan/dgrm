@@ -481,3 +481,83 @@ pub struct GrmStats {
     pub min_kinship: f64,
     pub max_kinship: f64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_io::VntrData;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempInputFile {
+        path: PathBuf,
+    }
+
+    impl TempInputFile {
+        fn new(contents: &str) -> Self {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "dgrm-grm-normalization-{}-{}.tsv",
+                std::process::id(),
+                timestamp
+            ));
+            fs::write(&path, contents).expect("failed to write temporary VNTR input");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempInputFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn assert_close(lhs: f64, rhs: f64) {
+        let diff = (lhs - rhs).abs();
+        assert!(
+            diff <= 1e-12,
+            "expected {lhs} and {rhs} to match within tolerance, diff={diff}"
+        );
+    }
+
+    #[test]
+    fn blockwise_matches_non_block_when_variants_are_filtered() {
+        let input = "\
+s1\t0\t1\tNaN\n\
+s2\t2\t1\tNaN\n\
+s3\t4\t1\t5\n\
+s4\t6\t1\tNaN\n";
+        let temp = TempInputFile::new(input);
+        let vntr_data = VntrData::load(temp.path()).expect("test VNTR input should load");
+
+        let calculator = GrmCalculator::new(2);
+        let regular = calculator
+            .calculate_grm(&vntr_data)
+            .expect("regular GRM calculation should succeed");
+        let blockwise = calculator
+            .calculate_grm_blockwise(&vntr_data, 2)
+            .expect("block-wise GRM calculation should succeed");
+
+        assert_eq!(regular.n_variants(), 1);
+        assert_eq!(blockwise.n_variants(), 1);
+        assert_eq!(regular.n_samples(), blockwise.n_samples());
+
+        for i in 0..regular.n_samples() {
+            for j in 0..regular.n_samples() {
+                assert_close(regular.value(i, j), blockwise.value(i, j));
+            }
+        }
+
+        let expected = 27.0 / 20.0;
+        assert_close(blockwise.value(0, 0), expected);
+        assert_close(blockwise.value(0, 3), -expected);
+    }
+}
